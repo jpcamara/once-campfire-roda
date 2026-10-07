@@ -5,15 +5,14 @@ module Campfire
   # Sequel database with two shards, :read_only for reads and :default for writes, so it holds
   # exactly two connections. A read runs to completion without yielding to the fiber scheduler, so
   # fibers never see each other's half-finished statements. Writes take a fiber-aware lock and
-  # BEGIN IMMEDIATE; the writer waits for other processes with a busy handler that sleeps (and so
-  # lets other fibers run, on the reader connection).
+  # BEGIN IMMEDIATE; the writer waits for other processes with the sqlite3 gem's busy handler,
+  # which sleeps (and so lets other fibers run, on the reader connection).
   #
   # Every query is a Sequel prepared statement, prepared once per connection and run by name.
   # Sequel's type conversion is off: values come back as SQLite stores them (Rails' text timestamps
   # among them), and the app parses them where it needs to.
   class DB
     BUSY_TIMEOUT_MS = 5_000
-    BUSY_RETRY_SECONDS = Float(ENV.fetch("CAMPFIRE_BUSY_RETRY", 0.0001))
 
     def self.path
       ENV.fetch("DATABASE_PATH") { File.join(ENV.fetch("STORAGE_PATH", "storage"), "db", "production.sqlite3") }
@@ -33,23 +32,10 @@ module Campfire
     end
 
     def self.configure(connection, server)
-      # busy_handler_timeout= with a shorter sleep between retries: another worker's write takes
-      # a few hundred microseconds, and the lock sits unused for whatever is left of the sleep.
-      # The sleep lets this process's other fibers run.
-      if server == :default
-        deadline = nil
-        connection.busy_handler do |count|
-          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          if count.zero?
-            deadline = now + BUSY_TIMEOUT_MS / 1000.0
-          elsif now > deadline
-            next false
-          else
-            sleep(BUSY_RETRY_SECONDS)
-          end
-          true
-        end
-      end
+      # The sqlite3 gem's own busy handling: the writer waits with busy_handler_timeout=, which
+      # sleeps between tries (and so lets this process's other fibers run); the reader keeps the
+      # plain busy_timeout Sequel sets from `timeout:`.
+      connection.busy_handler_timeout = BUSY_TIMEOUT_MS if server == :default
       connection.execute("PRAGMA journal_mode = WAL")
       connection.execute("PRAGMA synchronous = NORMAL")
       connection.execute("PRAGMA foreign_keys = ON")
