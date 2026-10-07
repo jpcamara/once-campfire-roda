@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # On the Hetzner box: one long-lived Sinatra container like bench/run-hetzner runs it, for checks
 # and quick measurements (the Rails agent's bench/probe, on this app's own ports).
-#   script/box-probe start [IMAGE]                 fresh seed copy, container sinatra-probe on PORT
+#   script/box-probe start [IMAGE]                 fresh seed copy, container roda-probe on PORT
 #   script/box-probe login                         the session cookie
 #   script/box-probe load ROUTE CONC SECS [ARGS]   ROUTE: room messages sidebar search post up avatar css
 #   script/box-probe stop
-# Env: SERVER_CPUS=4-7 LOADGEN_CPUS=0-3 PORT=4490 REDIS_PORT=6391 WEB_CONCURRENCY (default: CPUs)
+# Env: SERVER_CPUS=4-7 LOADGEN_CPUS=0-3 PORT=4790 REDIS_PORT=6393 WEB_CONCURRENCY (default: CPUs)
 set -euo pipefail
 
 BENCH_ROOT=${BENCH_ROOT:-/opt/campfire-perf/once-campfire-rust}
@@ -15,18 +15,18 @@ ENV_FILE=$BENCH_ROOT/parity/.env.reference
 LOADGEN=$BENCH_ROOT/target/bench/release/loadgen
 SERVER_CPUS=${SERVER_CPUS:-4-7}
 LOADGEN_CPUS=${LOADGEN_CPUS:-0-3}
-PORT=${PORT:-4490}
-REDIS_PORT=${REDIS_PORT:-6391}
+PORT=${PORT:-4790}
+REDIS_PORT=${REDIS_PORT:-6393}
 BASE=http://127.0.0.1:$PORT
-WORK=/opt/campfire-perf/.work-sinatra/probe
-NAME=sinatra-probe
+WORK=/opt/campfire-perf/.work-roda/probe
+NAME=roda-probe
 
 label() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$LABELS" "$1"; }
 lg() { taskset -c "$LOADGEN_CPUS" "$LOADGEN" "$@"; }
 
 case "${1:-}" in
   start)
-    image=${2:-campfire-sinatra:app}
+    image=${2:-campfire-roda:app}
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     rm -rf "$WORK"; mkdir -p "$WORK/db" "$WORK/storage"
     cp -a "$SEED/db/." "$WORK/db/"; cp -a "$SEED/storage/." "$WORK/storage/"
@@ -65,7 +65,7 @@ PY
       up) target=(--path /up) ;;
       post) target=(--post-room "$(label rooms.hq)" --csrf "") ;;
       avatar) target=(--path "/users/$(label avatar_tokens.jason)/avatar") ;;
-      css) target=(--path "/assets/$(ls /opt/campfire-perf/apps/sinatra/public/assets | grep '^_reset-.*[.]css$' | head -1)") ;;
+      css) target=(--path "/assets/$(ls /opt/campfire-perf/apps/roda/public/assets | grep '^_reset-.*[.]css$' | head -1)") ;;
       *) echo "unknown route $route" >&2; exit 2 ;;
     esac
     lg http --base "$BASE" --cookie "$cookie" "${target[@]}" --conc "$conc" --duration "$secs" "$@" ;;

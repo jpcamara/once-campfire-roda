@@ -2,7 +2,8 @@ source "https://rubygems.org"
 
 ruby ">= 3.4"
 
-gem "sinatra", "~> 4.1", require: "sinatra/base"
+gem "roda", "~> 3.99"
+gem "sequel", "~> 5.97"
 gem "falcon", "~> 0.57"
 gem "async-websocket", "~> 0.30"
 gem "sqlite3", "~> 2.9"

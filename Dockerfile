@@ -1,5 +1,5 @@
 # syntax = docker/dockerfile:1
-# Campfire on Sinatra and Falcon, with the Rails reference image's container interface: app in
+# Campfire on Roda and Falcon, with the Rails reference image's container interface: app in
 # /rails, storage in /rails/storage/{db,files}, uid 1000, HTTP on HTTP_PORT, its environment.
 ARG RUBY_VERSION=3.4.10
 ARG REFERENCE_IMAGE=campfire-reference:app

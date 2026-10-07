@@ -1,79 +1,121 @@
-require "sqlite3"
+require "sequel"
 
 module Campfire
-  # Two SQLite connections per process: one for reads, one for writes. Statements are prepared once
-  # per connection and reused. A read runs to completion without yielding to the fiber scheduler,
-  # so fibers never see each other's half-finished statements. Writes take a fiber-aware lock and
+  # Sequel over SQLite. Each DB (the process's, and one per job thread) is its own single-threaded
+  # Sequel database with two shards, :read_only for reads and :default for writes, so it holds
+  # exactly two connections. A read runs to completion without yielding to the fiber scheduler, so
+  # fibers never see each other's half-finished statements. Writes take a fiber-aware lock and
   # BEGIN IMMEDIATE; the writer waits for other processes with a busy handler that sleeps (and so
   # lets other fibers run, on the reader connection).
+  #
+  # Every query is a Sequel prepared statement, prepared once per connection and run by name.
+  # Sequel's type conversion is off: values come back as SQLite stores them (Rails' text timestamps
+  # among them), and the app parses them where it needs to.
   class DB
     BUSY_TIMEOUT_MS = 5_000
     BUSY_RETRY_SECONDS = Float(ENV.fetch("CAMPFIRE_BUSY_RETRY", 0.0001))
 
-    class Connection
-      def initialize(path, yielding_busy_handler:)
-        @db = SQLite3::Database.new(path)
-        if yielding_busy_handler
-          # busy_handler_timeout= with a shorter sleep between retries: another worker's write takes
-          # a few hundred microseconds, and the lock sits unused for whatever is left of the sleep.
-          # The sleep lets this process's other fibers run.
-          deadline = nil
-          @db.busy_handler do |count|
-            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            if count.zero?
-              deadline = now + BUSY_TIMEOUT_MS / 1000.0
-            elsif now > deadline
-              next false
-            else
-              sleep(BUSY_RETRY_SECONDS)
-            end
-            true
+    def self.path
+      ENV.fetch("DATABASE_PATH") { File.join(ENV.fetch("STORAGE_PATH", "storage"), "db", "production.sqlite3") }
+    end
+
+    # `IN (?, ?, ...)` for a list of ids; each list length is its own prepared statement.
+    def self.in_list(count)
+      Array.new(count, "?").join(", ")
+    end
+
+    def self.connect(path)
+      # SQLite's own LIKE (case-insensitive for ASCII), as Rails leaves it; Sequel turns it case-sensitive.
+      sequel = Sequel.sqlite(path, servers: { read_only: {} }, single_threaded: true, keep_reference: false,
+        timeout: BUSY_TIMEOUT_MS, case_sensitive_like: false, after_connect: ->(connection, server) { configure(connection, server) })
+      sequel.conversion_procs.clear
+      sequel
+    end
+
+    def self.configure(connection, server)
+      # busy_handler_timeout= with a shorter sleep between retries: another worker's write takes
+      # a few hundred microseconds, and the lock sits unused for whatever is left of the sleep.
+      # The sleep lets this process's other fibers run.
+      if server == :default
+        deadline = nil
+        connection.busy_handler do |count|
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          if count.zero?
+            deadline = now + BUSY_TIMEOUT_MS / 1000.0
+          elsif now > deadline
+            next false
+          else
+            sleep(BUSY_RETRY_SECONDS)
           end
-        else
-          @db.busy_timeout = BUSY_TIMEOUT_MS
+          true
         end
-        @db.execute("PRAGMA journal_mode = WAL")
-        @db.execute("PRAGMA synchronous = NORMAL")
-        @db.execute("PRAGMA foreign_keys = ON")
-        @db.execute("PRAGMA mmap_size = 0")
-        # Rails' journal_size_limit and cache_size; checkpoints are bin/checkpoint's.
-        @db.execute("PRAGMA journal_size_limit = 67108864")
-        @db.execute("PRAGMA cache_size = 2000")
-        @db.execute("PRAGMA wal_autocheckpoint = 0")
-        @statements = {}
+      end
+      connection.execute("PRAGMA journal_mode = WAL")
+      connection.execute("PRAGMA synchronous = NORMAL")
+      connection.execute("PRAGMA foreign_keys = ON")
+      connection.execute("PRAGMA mmap_size = 0")
+      # Rails' journal_size_limit and cache_size; checkpoints are bin/checkpoint's.
+      connection.execute("PRAGMA journal_size_limit = 67108864")
+      connection.execute("PRAGMA cache_size = 2000")
+      connection.execute("PRAGMA wal_autocheckpoint = 0")
+    end
+
+    # Prepared statements by shard and SQL, registered with Sequel once and named in the order they're
+    # first used.
+    class Statements
+      def initialize(sequel)
+        @sequel = sequel
+        @names = {}
+      end
+
+      def fetch(server, sql, arity)
+        @names[[ server, sql, arity ]] ||= :"q#{@names.size}".tap do |name|
+          binds = Array.new(arity) { :"$a#{it}" }
+          @sequel.dataset.with_sql(sql, *binds).server(server).prepare(:select, name)
+        end
+      end
+    end
+
+    # Queries on one shard. Rows come back as arrays, in the order of the SELECT's columns.
+    #
+    # A statement runs through Sequel::Database#execute by its prepared statement's name: Sequel's
+    # pool, cached SQLite statement and error handling, without binding through a cloned dataset or
+    # building a hash per row.
+    class Connection
+      ARGUMENT_KEYS = Array.new(256) { "a#{it}".freeze }.freeze # more for longer IN lists, made as needed
+
+      def initialize(sequel, statements, server)
+        @sequel, @statements, @server = sequel, statements, server
       end
 
       def rows(sql, *binds)
-        statement(sql).execute(*binds).to_a
+        rows = nil
+        @sequel.execute(@statements.fetch(@server, sql, binds.size), server: @server, arguments: arguments(binds)) { rows = it.to_a }
+        rows
       end
 
-      def row(sql, *binds)
-        stmt = statement(sql)
-        result = stmt.execute(*binds).next
-        stmt.reset!
-        result
-      end
+      def row(sql, *binds) = rows(sql, *binds).first
+      def value(sql, *binds) = row(sql, *binds)&.first
 
-      def value(sql, *binds)
-        row(sql, *binds)&.first
-      end
-
+      # The number of rows changed.
       def run(sql, *binds)
-        statement(sql).execute(*binds).to_a
-        @db.changes
-      end
-
-      def execute(sql)
-        @db.execute(sql)
+        @sequel.execute_dui(@statements.fetch(@server, sql, binds.size), server: @server, arguments: arguments(binds))
       end
 
       def last_insert_row_id
-        @db.last_insert_row_id
+        @sequel.synchronize(@server) { it.last_insert_row_id }
       end
 
       private
-        def statement(sql)
-          @statements[sql] ||= @db.prepare(sql)
+        # Header values can arrive binary-encoded, and SQLite binds those as BLOBs, which never
+        # equal TEXT. Everything the app binds is text.
+        def arguments(binds)
+          arguments = {}
+          binds.each_with_index do |value, i|
+            value = value.dup.force_encoding(Encoding::UTF_8) if value.is_a?(String) && value.encoding == Encoding::BINARY
+            arguments[ARGUMENT_KEYS[i] || "a#{i}"] = value
+          end
+          arguments
         end
     end
 
@@ -81,15 +123,14 @@ module Campfire
     # changes whenever another connection commits: this process's writer, or another worker's. It's
     # read again at the start of each request, cable command and job (DB#check_for_changes), and the
     # cache is also cleared after this process's own commits. Rows are frozen, as they're shared.
-    # `generation` counts the clears: pages kept by it (App#kept_response) last as long as the reads
-    # they were made from.
+    # `generation` counts the clears: anything kept by it lasts as long as the reads it was made from.
     class ReadCache
       LIMIT = 8192
 
       attr_reader :generation
 
-      def initialize(reader)
-        @reader = reader
+      def initialize(sequel)
+        @sequel = sequel
         @entries = {}
         @by_object = {}.compare_by_identity
         @version = nil
@@ -117,7 +158,7 @@ module Campfire
       end
 
       def check_for_changes
-        version = @reader.value("PRAGMA data_version")
+        version = @sequel.synchronize(:read_only) { it.get_first_value("PRAGMA data_version") }
         clear unless version == @version
         @version = version
       end
@@ -129,15 +170,13 @@ module Campfire
       end
     end
 
-    def self.path
-      ENV.fetch("DATABASE_PATH") { File.join(ENV.fetch("STORAGE_PATH", "storage"), "db", "production.sqlite3") }
-    end
-
     def initialize(path = self.class.path)
-      @reader = Connection.new(path, yielding_busy_handler: false)
-      @writer = Connection.new(path, yielding_busy_handler: true)
+      @sequel = self.class.connect(path)
+      statements = Statements.new(@sequel)
+      @reader = Connection.new(@sequel, statements, :read_only)
+      @writer = Connection.new(@sequel, statements, :default)
       @write_lock = Mutex.new
-      @cache = ReadCache.new(@reader)
+      @cache = ReadCache.new(@sequel)
     end
 
     def rows(sql, *binds) = @cache.fetch([ :rows, sql, *binds ]) { @reader.rows(sql, *binds).each(&:freeze).freeze }
@@ -154,23 +193,10 @@ module Campfire
 
     def transaction
       @write_lock.synchronize do
-        @writer.execute("BEGIN IMMEDIATE")
-        begin
-          result = yield @writer
-          @writer.execute("COMMIT")
-          result
-        rescue Exception
-          @writer.execute("ROLLBACK") rescue nil
-          raise
-        ensure
-          @cache.clear
-        end
+        @sequel.transaction(server: :default, mode: :immediate) { yield @writer }
+      ensure
+        @cache.clear
       end
-    end
-
-    # `IN (?, ?, ...)` for a list of ids; each list length is its own cached statement.
-    def self.in_list(count)
-      Array.new(count, "?").join(", ")
     end
   end
 end

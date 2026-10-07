@@ -1,6 +1,7 @@
 require_relative "lib/campfire"
 
 Campfire.boot
+Campfire::App.freeze
 # Falcon loads this file in each worker process.
 warn "campfire worker #{Process.pid}: YJIT #{defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? ? "enabled" : "disabled"}"
 

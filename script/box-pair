@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # On the Hetzner box: the reference and this app side by side on fresh seed copies, for comparisons.
-#   script/box-pair start [IMAGE]   reference on 4494 (Thruster; Puma on 4495), this app on 4496
+#   script/box-pair start [IMAGE]   reference on 4794 (Thruster; Puma on 4795), this app on 4796
 #   script/box-pair stop
-# Both get the parity environment and the reference's Redis config on port 6391.
+# Both get the parity environment and the reference's Redis config on port 6393.
 set -euo pipefail
 BENCH_ROOT=${BENCH_ROOT:-/opt/campfire-perf/once-campfire-rust}
 SEED=$BENCH_ROOT/parity/.seed/default
-WORK=/opt/campfire-perf/.work-sinatra/pair
+WORK=/opt/campfire-perf/.work-roda/pair
 CPUS=${SERVER_CPUS:-4-7}
 
 fresh() { # dir
@@ -26,20 +26,20 @@ wait_up() { for _ in $(seq 1 600); do curl -fsS -o /dev/null "http://127.0.0.1:$
 
 case "${1:-}" in
   start)
-    image=${2:-campfire-sinatra:app}
+    image=${2:-campfire-roda:app}
     "$0" stop
-    mkdir -p "$WORK"; printf 'port 6391\nbind 127.0.0.1\ndaemonize no\nappendonly no\nsave ""\n' > "$WORK/redis.conf"
+    mkdir -p "$WORK"; printf 'port 6393\nbind 127.0.0.1\ndaemonize no\nappendonly no\nsave ""\n' > "$WORK/redis.conf"
     args=(); while IFS= read -r line; do args+=(-e "$line"); done < <(grep -Ev '^(#|$|WEB_CONCURRENCY|RAILS_LOG_LEVEL)' "$BENCH_ROOT/parity/.env.reference")
     fresh "$WORK/ref"; fresh "$WORK/app"
-    docker run -d --name sinatra-ref --cpuset-cpus "$CPUS" --user 1000:1000 --network host "${args[@]}" -e WEB_CONCURRENCY=2 \
-      -e HTTP_PORT=4494 -e TARGET_PORT=4495 -e REDIS_URL=redis://127.0.0.1:6391/0 -v "$WORK/redis.conf:/rails/config/redis.conf:ro" \
+    docker run -d --name roda-ref --cpuset-cpus "$CPUS" --user 1000:1000 --network host "${args[@]}" -e WEB_CONCURRENCY=2 \
+      -e HTTP_PORT=4794 -e TARGET_PORT=4795 -e REDIS_URL=redis://127.0.0.1:6393/0 -v "$WORK/redis.conf:/rails/config/redis.conf:ro" \
       -v "$WORK/ref/db:/rails/storage/db" -v "$WORK/ref/storage:/rails/storage/files" campfire-reference:app >/dev/null
-    wait_up 4494 || { docker logs sinatra-ref 2>&1 | tail -20; exit 1; }
-    docker run -d --name sinatra-app --cpuset-cpus "$CPUS" --user 1000:1000 --network host "${args[@]}" -e WEB_CONCURRENCY=2 \
-      -e HTTP_PORT=4496 -e REDIS_URL=redis://127.0.0.1:6391/1 ${EXTRA_ENV:-} \
+    wait_up 4794 || { docker logs roda-ref 2>&1 | tail -20; exit 1; }
+    docker run -d --name roda-app --cpuset-cpus "$CPUS" --user 1000:1000 --network host "${args[@]}" -e WEB_CONCURRENCY=2 \
+      -e HTTP_PORT=4796 -e REDIS_URL=redis://127.0.0.1:6393/1 ${EXTRA_ENV:-} \
       -v "$WORK/app/db:/rails/storage/db" -v "$WORK/app/storage:/rails/storage/files" "$image" >/dev/null
-    wait_up 4496 || { docker logs sinatra-app 2>&1 | tail -20; exit 1; }
-    echo "reference :4494, $image :4496" ;;
-  stop) docker rm -f sinatra-ref sinatra-app >/dev/null 2>&1 || true ;;
+    wait_up 4796 || { docker logs roda-app 2>&1 | tail -20; exit 1; }
+    echo "reference :4794, $image :4796" ;;
+  stop) docker rm -f roda-ref roda-app >/dev/null 2>&1 || true ;;
   *) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 1 ;;
 esac
