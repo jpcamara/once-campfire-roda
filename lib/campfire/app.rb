@@ -1,4 +1,6 @@
 require "roda"
+require "rack/method_override"
+require "rack/files"
 require "securerandom"
 require "bcrypt"
 require "uri"
