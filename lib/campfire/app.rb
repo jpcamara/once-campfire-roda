@@ -454,8 +454,16 @@ module Campfire
       halt 412 if env["HTTP_IF_MATCH"] && !matches.(env["HTTP_IF_MATCH"])
     end
 
-    # A file from disk, with Rack::Files' Last-Modified, conditional and byte-range handling.
-    def send_file(path, type:)
+    # The request body as the bot API reads it (Rails' request.raw_post). A form-encoded body has
+    # already been read by Rack::MethodOverride, which keeps the bytes it parsed.
+    def raw_body
+      raw = env["rack.request.form_vars"] || (request.body.rewind; request.body.read)
+      raw.to_s.dup.force_encoding(Encoding::UTF_8)
+    end
+
+    # A file from disk, with Rack::Files' Last-Modified, conditional and byte-range handling. Only
+    # an inline file (no disposition) is sent here.
+    def send_file(path, type:, disposition: nil)
       headers "Content-Type" => text_type?(type) ? "#{type};charset=utf-8" : type
       status_code, file_headers, body = Rack::Files.new(File.dirname(path)).serving(request, path)
       file_headers.each { |name, value| response.headers[name] ||= value }
@@ -1031,8 +1039,7 @@ module Campfire
       bot, room = bot_room!(bot_key, room_id)
       @current_user = bot
       attachment = params["attachment"]
-      request.body.rewind
-      raw = request.body.read.to_s.force_encoding("UTF-8")
+      raw = raw_body
       head_response(422) if attachment.to_s.empty? && raw.empty?
       message_params = attachment.is_a?(Hash) ? { "attachment" => attachment } : { "body" => raw }
       message = Messages.create(self, room: room, creator: bot, params: message_params)
@@ -1058,8 +1065,7 @@ module Campfire
       bot, room = bot_room!(bot_key, room_id)
       @current_user = bot
       message = repo.room_message(room.id, message_id.to_i) or head_response(404)
-      request.body.rewind
-      content = request.body.read.to_s.force_encoding("UTF-8")
+      content = raw_body
       head_response(422) if content.strip.empty?
       boost = Boosts.create(self, message, content)
       status 201
@@ -1373,8 +1379,7 @@ module Campfire
       message = repo.room_message(room.id, id.to_i) or record_not_found!
       head_response(403) unless bot.can_administer?(message)
       # Messages::ByBotsController#message_params: the raw request body is the message
-      request.body.rewind
-      message = Messages.update(self, room, message, request.body.read.to_s.force_encoding("UTF-8"))
+      message = Messages.update(self, room, message, raw_body)
       headers "Content-Type" => "application/json; charset=utf-8"
       RailsJSON.generate(BotApi.message_json(self, message))
     end
