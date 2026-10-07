@@ -440,6 +440,7 @@ module Campfire
     # Ends the request with a status, headers and body (any of them), as a Rails head or render
     # from a before-action does.
     def halt(*result)
+      @matched = true # a halt answers the request, even from the before-action (a banned IP's 429)
       respond(result.size == 1 ? result.first : result)
     end
 
