@@ -43,7 +43,67 @@ uses the same data-layer library as the Rage app (Sequel), so each comparison is
 
 ## Performance
 
-*Final numbers are being measured; this section will carry them.*
+Final run, Oct 8 2026, on the code after the precedent audit (image built from 44c135c). It used DHH's
+`bench/run` on a Hetzner Ryzen 7 PRO 8700GE. Each app gets four hardware threads, with the load
+generator on four others. YJIT and jemalloc are on. Each number is the median of 3 runs in rotating
+order, with stock Rails, Sinatra, Rage and DHH's Rust port in the same session. There were 0 errors.
+
+| HTTP workload (requests/sec, 16 clients) | Rails (stock) | Sinatra | Rage | **Roda** | Rust |
+|---|---:|---:|---:|---:|---:|
+| Room page | 222 | 11,303 | 10,146 | **12,431** | 21,206 |
+| Messages page | 362 | 16,197 | 24,784 | **19,386** | 23,634 |
+| Sidebar | 467 | 22,533 | 33,989 | **27,366** | 20,652 |
+| Search | 372 | 14,574 | 16,843 | **16,294** | 21,361 |
+| Post a message | 197 | 1,851 | 1,639 | **1,732** | 4,122 |
+| Avatar | 62,119 | 73,951 | 178,931 | **75,871** | 196,130 |
+
+| Other | Rails (stock) | Sinatra | Rage | **Roda** | Rust |
+|---|---:|---:|---:|---:|---:|
+| Action Cable, 1,000 clients: p50 delivery | 42.0 ms | 8.1 ms | 5.0 ms | **7.9 ms** | 4.0 ms |
+| Action Cable, 1,000 clients: saturated delivery | 12 msg/s | 98 msg/s | 190 msg/s | **104 msg/s** | 377 msg/s |
+| Upload + thumbnail (505 KB) | 87 ms | 59 ms | 134 ms | **131 ms** | 35 ms |
+| Idle memory (anon) | 282 MB | 199 MB | 170 MB | **196 MB** | 13 MB |
+| Cold start | 3.6 s | 1.5 s | 1.6 s | **1.4 s** | 0.3 s |
+
+In every Action Cable run, every client got every message.
+
+- **Against Sinatra:** the two apps share every file except the web layer (`app.rb`) and the database
+  layer (`db.rb`), and run on the same server. So the gap is Roda + Sequel against Sinatra + the
+  sqlite3 gem. Roda reads 10–21% faster on every page route. It posts 6% slower.
+- **Against Rage:** the two share Sequel and the view code, but not the server. Rage leads on the
+  messages page, the sidebar, avatars and Action Cable, where Iodine's C layer does the work.
+- **Uploads are noisy between runs.** Sinatra measured 135 ms in an earlier run and 59 ms in this one.
+  The cause hasn't been found.
+
+**Room-page reads while posts arrive** (reads/sec at 16 clients while another user posts into the
+same room; median of 3 reps, each on a fresh seed, every post at the offered rate, 0 errors). Roda's
+row is its own run. The other rows are from the Oct 8 final mixed run on the same box, on the same
+code as above (stock Rails and Rust from Oct 7; their code didn't change):
+
+| Posts/sec in the background | 0 | 20 | 100 | Post p50 at 100/s |
+|---|---:|---:|---:|---:|
+| Rails (stock) | 228 | 214 | 194 | 9.9 ms |
+| Sinatra | 11,253 | 10,806 | 7,748 | 3.1 ms |
+| Rage | 10,100 | 9,361 | 6,558 | 3.6 ms |
+| **Roda** | **12,282** | **11,124** | **7,686** | **3.2 ms** |
+| Rust | 20,968 | 20,526 | 19,156 | 2.2 ms |
+
+**Rust-level caching only** (`CAMPFIRE_CACHING=rust`: the Elixir-only caches off, Rust's kept). Same box
+and harness, 3 runs, HTTP suite, 0 errors:
+
+| Workload (req/s, 16 clients) | Full caching | Rust-level caching only | Rust |
+|---|---:|---:|---:|
+| Room page | 12,431 | 5,037 | 21,206 |
+| Messages page | 19,386 | 8,413 | 23,634 |
+| Sidebar | 27,366 | 6,448 | 20,652 |
+| Search | 16,294 | 7,269 | 21,361 |
+| Post a message | 1,732 | 1,676 | 4,122 |
+
+With Rust's caching alone, Roda reads at 24–36% of Rust's rate and posts at 41% of it.
+
+**Hardware.** This box is slower than DHH's: Rust runs at about 60% of his published numbers here,
+and stock Rails at about 90% of his on reads. So his table overstates the Ruby-to-Rust gap by about
+1.5×.
 
 ## Caching and optimizations
 
@@ -90,7 +150,29 @@ worker says `X-Cache: miss` where Thruster says `hit`. That's the same as Sinatr
 
 ## Status
 
-*Final parity and security results are being collected; this section will carry them.*
+- **Parity:** on the final image, the Playwright harness passes every cell on every seed, with no
+  allowed differences:
+
+  | Seed | Cells passing |
+  |---|---:|
+  | default | 874 / 874 |
+  | crowd | 25 / 25 |
+  | custom_styles | 33 / 33 |
+  | first_run | 16 / 16 |
+  | restricted | 8 / 8 |
+
+- **Server HTML:** 64 pages match the reference on a fresh pass and a cached pass, and all 24 write
+  flows give the same status and redirect.
+- **Cache check mode:** 0 mismatches across posts and a rename from 4 processes.
+- **Security:** the audit's fix checks pass, 28 of 28. They cover:
+  - stored XSS through uploads
+  - the `/cable` Origin rules
+  - forgery rules, including cookie-authenticated bot writes
+  - fragment-marker injection
+  - HTTPS headers
+  - private-IP bans
+  - boost length
+  - `X-Request-Id`
 
 ## Running it
 
