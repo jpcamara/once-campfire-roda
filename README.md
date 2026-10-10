@@ -105,6 +105,60 @@ With Rust's caching alone, Roda reads at 24–36% of Rust's rate and posts at 41
 and stock Rails at about 90% of his on reads. So his table overstates the Ruby-to-Rust gap by about
 1.5×.
 
+## Finished-page cache (Oct 10)
+
+Upstream Rails now keeps finished private pages until the database changes
+([ac73267](https://github.com/basecamp/once-campfire/commit/ac73267),
+[0f5d0b2](https://github.com/basecamp/once-campfire/commit/0f5d0b2),
+[8d02540](https://github.com/basecamp/once-campfire/commit/8d02540)), following the C port. The Rust
+port added the same thing
+([d09811c](https://github.com/basecamp/once-campfire-rust/commit/d09811c),
+`crates/campfire/src/response_cache.rs`). So this app does it too (`lib/campfire/page_cache.rb`):
+
+- **What's kept:** the room, messages, sidebar and search pages of a signed-in user, body and gzip.
+- **When it's dropped:** any SQLite commit from any process clears it (`PRAGMA data_version`). The
+  version is captured before authentication and checked again at lookup and admission, so a commit
+  during a render can't leave a stale page under the new version. Entries also expire after 15
+  seconds, as Rust's do.
+- **What still runs on every request:** authentication, the room access check and cookies.
+- **Not kept:** pages with a flash, conditional requests, and responses that set a cookie.
+- **Bounds:** `CAMPFIRE_RESPONSE_CACHE_MB` per process (default 64, 0 turns it off), 1 MB per page.
+  Concurrent renders of one page collapse into one.
+- **`CAMPFIRE_CACHING=rust`** keeps this cache on, since the Rust port has it.
+
+**Checks:** every Playwright cell on every seed passes (default 874, crowd 25, custom_styles 33,
+first_run 16, restricted 8). Server HTML matches the reference on 128 of 128 pages, fresh and
+cached. All 24 write flows match. With the cache on and off, 60 requests across these scenarios
+give identical statuses: foreign writes to a message body and to a user's name, a revoked
+membership, a banned user, a deleted session. Every read after a foreign write shows it. Check mode
+(`CAMPFIRE_CHECK_CACHES=1`) found 0 mismatches across reads, posts and foreign writes from all 4
+processes.
+
+Measured with DHH's verification harness
+([basecamp/once-campfire-verification](https://github.com/basecamp/once-campfire-verification)
+`ec02deb`) on the Hetzner box: app on CPUs 4-7, load generator on 0-3, 3 rounds, 8-second samples.
+Upstream Rails `0aa339d` and Rust `6dae2fd` ran in the same session. Every response passed the
+harness's route checks, and every write passed its audit, with 0 errors or invalid responses.
+
+| Requests/sec, 16 clients | Roda before | **Roda with page cache** | Rails (upstream) | Rust |
+|---|---:|---:|---:|---:|
+| Room page | 12,103 | **24,769** | 3,189 | 42,282 |
+| Messages page | 18,694 | **27,073** | 3,206 | 40,615 |
+| Sidebar | 26,326 | **26,254** | 3,568 | 48,314 |
+| Search | 15,738 | **26,107** | 3,450 | 47,564 |
+| Post a message | 1,803 | **1,823** | 282 | 4,792 |
+
+Mixed profile (16 readers plus one writer at 10 posts/sec, read requests/sec):
+
+| Read requests/sec | Roda before | **Roda with page cache** | Rails (upstream) | Rust |
+|---|---:|---:|---:|---:|
+| Room page | 11,726 | **23,242** | 1,545 | 39,564 |
+| Messages page | 17,988 | **25,975** | 1,875 | 37,997 |
+| Sidebar | 25,419 | **24,994** | 2,838 | 46,939 |
+| Search | 15,354 | **24,818** | 2,580 | 46,151 |
+
+"Before" is the same harness earlier on Oct 10, without this cache.
+
 ## Caching and optimizations
 
 The rule: every optimization is one of these.
@@ -121,6 +175,7 @@ The rule: every optimization is one of these.
 | Page ETags from page parts; cookies only when they change; `Sec-Fetch-Site` CSRF | (2) | Rust 2947c64, 2f755bf, b567772 |
 | Public-response cache (avatars, assets) | (2) | Rust `crates/kit/src/front/cache.rs` |
 | Prepared statements | (2) | Rust `crates/db/src/database.rs` |
+| Finished private pages until the database changes | (2) | Rust d09811c `crates/campfire/src/response_cache.rs`; upstream Rails ac73267 |
 | WAL checkpoints in their own process | (2) | Rust `crates/db/src/database.rs` (checkpointer thread) |
 | Read cache cleared on `PRAGMA data_version` | (3) | Elixir `lib/campfire/db.ex` |
 | Finished sidebar until its data changes | (3) | Elixir `lib/campfire/sidebar.ex` |
